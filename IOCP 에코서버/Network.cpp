@@ -1,14 +1,13 @@
 ﻿#pragma comment(lib, "ws2_32")
-#include "Network.h"
-#include "Log.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <process.h>
-#include "RingBuffer.h"
-#include "SerializationBuffer.h"
-//#include <map>
 #include <unordered_map>
 #include <locale.h>
+#include "Network.h"
+#include "Log.h"
+#include "RingBuffer.h"
+
 
 #define EXIT_THREAD_CODE	
 
@@ -27,6 +26,8 @@ struct Session
 	WsaOverlappedEX recvOverlapped;
 	RingBuffer sendRingBuffer;
 	RingBuffer recvRingBuffer;
+	RingBuffer updateThreadQueue;
+	SRWLOCK srwlock;
 	int overlappedIOCnt;
 	int waitSend;
 
@@ -36,6 +37,8 @@ struct Session
 	, sessionID(id)
 	, sendRingBuffer(1048576)
 	, recvRingBuffer(1048576)
+	, updateThreadQueue(1048576)
+	, srwlock(RTL_SRWLOCK_INIT)
 	, overlappedIOCnt(0)
 	, waitSend(false)
 	{
@@ -52,10 +55,21 @@ DWORD numberOfConcurrentThread;
 DWORD numberOfCreateIOCPWorkerThread;
 HANDLE hIOCP;
 HANDLE hThreadAccept;
+HANDLE hThreadUpdate;
 HANDLE* hThreadIOCPWorker;
+HANDLE hEventExitUpdateThread;
+HANDLE hEventWakeUpdateThread;
+
 std::unordered_map<SESSIONID, Session*> sessionMap;
-SRWLOCK	srwlock = RTL_SRWLOCK_INIT;
+SRWLOCK	srwlockSessionMap = RTL_SRWLOCK_INIT;
+
+RingBuffer sessionListForUpdate(2048);
+
 static void (*OnRecv)(SESSIONID sessionID, SerializationBuffer& packet) = nullptr;
+
+unsigned int WINAPI AcceptThread(LPVOID args);
+unsigned int WINAPI	IOCPWorkerThread(LPVOID args);
+unsigned int WINAPI UpdateThread(LPVOID args);
 
 void ReleaseServerResource()
 {
@@ -97,7 +111,7 @@ void RequestExitNetworkLibThread(void)
 	ReleaseServerResource();
 
 	CloseHandle(hThreadAccept);
-	for (int i = 0; i < numberOfCreateIOCPWorkerThread; ++i)
+	for (DWORD i = 0; i < numberOfCreateIOCPWorkerThread; ++i)
 	{
 		CloseHandle(hThreadIOCPWorker[i]);
 	}
@@ -197,21 +211,47 @@ bool InitNetworkIOThread(void)
 		return false;
 	}
 
+	hEventWakeUpdateThread = CreateEvent(nullptr, false, false, nullptr);
+	hEventExitUpdateThread = CreateEvent(nullptr, false, false, nullptr);
+	if (hEventWakeUpdateThread == nullptr || hEventExitUpdateThread == nullptr)
+	{
+		_Log(dfLOG_LEVEL_SYSTEM, "현재 서버의 논리코어가 1개만 존재합니다. 시스템 구동이 불가능 합니다.");
+		CloseHandle(hIOCP);
+		return false;
+	}
+
 	hThreadIOCPWorker = new HANDLE[numberOfCreateIOCPWorkerThread];
 	for (idx = 0; idx < numberOfCreateIOCPWorkerThread; ++idx)
 	{
 		hThreadIOCPWorker[idx] = (HANDLE)_beginthreadex(nullptr, 0, IOCPWorkerThread, (void*)idx, 0, nullptr);
-		if (hThreadIOCPWorker == nullptr)
+		if (hThreadIOCPWorker[idx] == nullptr)
 		{
 			closesocket(gListenSock);
 			_Log(dfLOG_LEVEL_SYSTEM, "_beginthreadex(IOCPWorkerThread) error code: %d", GetLastError());
 			for (DWORD j = 0; j < idx; ++j)
 			{
 				PostQueuedCompletionStatus(hIOCP, 0, 0, nullptr);
+				CloseHandle(hThreadIOCPWorker[j]);
 			}
 			CloseHandle(hIOCP);
+			delete[] hThreadIOCPWorker;
 			return false;
 		}
+	}
+
+	hThreadUpdate = (HANDLE)_beginthreadex(nullptr, 0, UpdateThread, nullptr, 0, nullptr);
+	if (hThreadUpdate == nullptr)
+	{
+		closesocket(gListenSock);
+		_Log(dfLOG_LEVEL_SYSTEM, "_beginthreadex(UpdateThread) error code: %d", GetLastError());
+		for (idx = 0; idx < numberOfCreateIOCPWorkerThread; ++idx)
+		{
+			PostQueuedCompletionStatus(hIOCP, 0, 0, nullptr);
+			CloseHandle(hThreadIOCPWorker[idx]);
+		}
+		CloseHandle(hIOCP);
+		delete[] hThreadIOCPWorker;
+		return false;
 	}
 
 	hThreadAccept = (HANDLE)_beginthreadex(nullptr, 0, AcceptThread, nullptr, 0, nullptr);
@@ -222,8 +262,10 @@ bool InitNetworkIOThread(void)
 		for (idx = 0; idx < numberOfCreateIOCPWorkerThread; ++idx)
 		{
 			PostQueuedCompletionStatus(hIOCP, 0, 0, nullptr);
+			CloseHandle(hThreadIOCPWorker[idx]);
 		}
 		CloseHandle(hIOCP);
+		CloseHandle(hThreadUpdate);
 		return false;
 	}
 
@@ -234,9 +276,9 @@ Session* CreateSession(SOCKET clientSock, SOCKADDR_IN* clientAddr)
 {
 	CreateIoCompletionPort((HANDLE)clientSock, hIOCP, gSessionID, 0);
 	Session* ptrNewSession = new Session(clientSock, clientAddr, gSessionID);
-	AcquireSRWLockExclusive(&srwlock);
+	AcquireSRWLockExclusive(&srwlockSessionMap);
 	sessionMap.insert({ gSessionID, ptrNewSession });
-	ReleaseSRWLockExclusive(&srwlock);
+	ReleaseSRWLockExclusive(&srwlockSessionMap);
 	gSessionID += 1;
 	return ptrNewSession;
 }
@@ -245,10 +287,10 @@ void ReleaseSession(Session* ptrSession)
 {
 	//세션 삭제
 	closesocket(ptrSession->socket);
-	AcquireSRWLockExclusive(&srwlock);
+	AcquireSRWLockExclusive(&srwlockSessionMap);
 	sessionMap.erase(ptrSession->sessionID);
-	ReleaseSRWLockExclusive(&srwlock);
 	delete ptrSession;
+	ReleaseSRWLockExclusive(&srwlockSessionMap);
 }
 
 void SetOnRecvEvent(void (*_OnRecv)(SESSIONID sessionID, SerializationBuffer& packet))
@@ -390,9 +432,9 @@ void SendPacket(SESSIONID sessionID, SerializationBuffer& sendPacket)
 	RingBuffer* ptrSendRingBuffer;
 	WORD sendPacketHeader;
 
-	AcquireSRWLockShared(&srwlock);
+	//AcquireSRWLockShared(&srwlockSessionMap);
 	ptrSession = sessionMap.at(sessionID);
-	ReleaseSRWLockShared(&srwlock);
+	//ReleaseSRWLockShared(&srwlockSessionMap);
 
 	if ((sendPacketHeader = sendPacket.GetUseSize()) == 0)
 	{
@@ -415,7 +457,7 @@ void SendPacket(SESSIONID sessionID, SerializationBuffer& sendPacket)
 	PostSend(ptrSession);
 }
 
-unsigned WINAPI AcceptThread(LPVOID args)
+unsigned int WINAPI AcceptThread(LPVOID args)
 {
 	int acceptErrorCode;
 	DWORD flags = 0;
@@ -444,7 +486,7 @@ unsigned WINAPI AcceptThread(LPVOID args)
 	}
 }
 
-unsigned WINAPI IOCPWorkerThread(LPVOID args)
+unsigned int WINAPI IOCPWorkerThread(LPVOID args)
 {
 	DWORD numberOfBytesTransferred = 0;
 	SESSIONID sessionID = 0;
@@ -452,10 +494,10 @@ unsigned WINAPI IOCPWorkerThread(LPVOID args)
 	Session* ptrSession;
 	RingBuffer* ptrRecvRingBuffer;
 	int retvalGQCS;
-	SerializationBuffer recvPacket;
+	SerializationBuffer recvPacket(1048576);
 	WORD recvPacketHeader;
 
-	_Log(dfLOG_LEVEL_SYSTEM, "[No.%lld] IOCPWorkerThread", (_int64)args);
+	_Log(dfLOG_LEVEL_SYSTEM, "[No.%lld] IOCPWorkerThread Start", (_int64)args);
 	for (;;)
 	{
 		numberOfBytesTransferred = 0;
@@ -506,10 +548,11 @@ unsigned WINAPI IOCPWorkerThread(LPVOID args)
 
 			ptrRecvRingBuffer = &ptrSession->recvRingBuffer;
 			ptrRecvRingBuffer->MoveRear(numberOfBytesTransferred);
+			recvPacket.ClearBuffer();
 			for (;;)
 			{
 				//  이시점에 clear 필요 언제 break 해서 빠져 나갈지 모르기때문에
-				recvPacket.ClearBuffer();
+				//recvPacket.ClearBuffer();
 				if (ptrRecvRingBuffer->GetUseSize() <= sizeof(recvPacketHeader))
 				{
 					break;
@@ -523,9 +566,23 @@ unsigned WINAPI IOCPWorkerThread(LPVOID args)
 				ptrRecvRingBuffer->MoveFront(sizeof(recvPacketHeader));
 				ptrRecvRingBuffer->Dequeue(recvPacket.GetRearBufferPtr(), recvPacketHeader);
 				recvPacket.MoveRear(recvPacketHeader);
-					
-				OnRecv(sessionID, recvPacket);
+
+				//AcquireSRWLockExclusive(&ptrSession->srwlock);
+				ptrSession->updateThreadQueue.Enqueue(recvPacket.GetFrontBufferPtr(), recvPacketHeader);
+				
+				//ReleaseSRWLockExclusive(&ptrSession->srwlock);
+				recvPacket.MoveFront(recvPacketHeader);
+				//OnRecv(sessionID, recvPacket);
 			}
+
+			if (ptrSession->updateThreadQueue.GetUseSize() > 0)
+			{
+				sessionListForUpdate.Lock();
+				sessionListForUpdate.Enqueue((char*)&sessionID, sizeof(sessionID));
+				sessionListForUpdate.UnLock();
+				SetEvent(hEventWakeUpdateThread);
+			}
+
 			PostRecv(ptrSession);
 		}
 		else if (&(ptrSession->sendOverlapped) == overlapped)
@@ -546,5 +603,41 @@ unsigned WINAPI IOCPWorkerThread(LPVOID args)
 			//세션 삭제
 			ReleaseSession(ptrSession);
 		}
+	}
+}
+
+#define EXIT_THREAD	WAIT_OBJECT_0 + 1
+
+unsigned int WINAPI UpdateThread(LPVOID args)
+{
+	DWORD result;
+	HANDLE hEventArr[2];
+	hEventArr[0] = hEventWakeUpdateThread;
+	hEventArr[1] = hEventExitUpdateThread;
+	SESSIONID sessionID;
+
+	Session* ptrSession;
+	SerializationBuffer serialBuffer(8);
+
+	for (;;)
+	{
+		result = WaitForMultipleObjects(2, hEventArr, false, INFINITE);
+		if (result == EXIT_THREAD || result == WAIT_FAILED)
+		{
+			_Log(dfLOG_LEVEL_SYSTEM, L"UpdateThread Exit");
+			return 0;
+		}
+
+		sessionListForUpdate.Dequeue((char*)&sessionID, sizeof(sessionID));
+		AcquireSRWLockShared(&srwlockSessionMap);
+		ptrSession = sessionMap.at(sessionID);
+		while (ptrSession->updateThreadQueue.GetUseSize())
+		{
+			ptrSession->updateThreadQueue.Dequeue(serialBuffer.GetRearBufferPtr(), 8);
+			serialBuffer.MoveRear(8);
+			OnRecv(sessionID, serialBuffer);
+			serialBuffer.ClearBuffer();
+		}
+		ReleaseSRWLockShared(&srwlockSessionMap);
 	}
 }
