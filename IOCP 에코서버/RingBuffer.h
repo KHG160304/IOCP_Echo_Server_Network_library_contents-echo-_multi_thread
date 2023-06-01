@@ -1,6 +1,8 @@
 ﻿#pragma once
 #ifndef __RING_BUFFER_H__
 #define __RING_BUFFER_H__
+#include <windows.h>
+
 class RingBuffer
 {
 public:
@@ -23,11 +25,14 @@ public:
 	char* GetRearBufferPtr(void) const;
 	char* GetFrontBufferPtr(void) const;
 	char* GetInternalBufferPtr(void) const;
+	void Lock();
+	void UnLock();
 private:
 	char* __internalBuffer;
 	int __capacity;
 	int __queueFrontIndex;
 	int __queueRearIndex;
+	CRITICAL_SECTION cs;
 };
 
 #endif // !__RING_BUFFER_H__

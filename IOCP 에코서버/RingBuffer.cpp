@@ -2,6 +2,7 @@
 #include "RingBuffer.h"
 #include <memory.h>
 
+
 static int defaultCapacity = sizeof(size_t);//1000;//1048576; // 1mb : 1024byte(1kb) * 1024
 static int minCapacity = 2; // 100byte is minimum size
 
@@ -11,6 +12,7 @@ RingBuffer::RingBuffer(void)
 	, __queueFrontIndex(0)
 	, __queueRearIndex(0)
 {
+	InitializeCriticalSection(&this->cs);
 }
 
 RingBuffer::RingBuffer(int capacity)
@@ -26,10 +28,12 @@ RingBuffer::RingBuffer(int capacity)
 		this->__capacity = capacity + 1;
 	}
 	this->__internalBuffer = new char[this->__capacity];
+	InitializeCriticalSection(&this->cs);
 }
 
 RingBuffer::~RingBuffer()
 {
+	DeleteCriticalSection(&this->cs);
 	delete[] __internalBuffer;
 }
 
@@ -226,4 +230,14 @@ char* RingBuffer::GetFrontBufferPtr(void) const
 char* RingBuffer::GetInternalBufferPtr(void) const
 {
 	return this->__internalBuffer;
+}
+
+void RingBuffer::Lock()
+{
+	EnterCriticalSection(&this->cs);
+}
+
+void RingBuffer::UnLock()
+{
+	LeaveCriticalSection(&this->cs);
 }
